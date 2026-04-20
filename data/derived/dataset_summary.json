@@ -1,0 +1,20 @@
+{
+  "rows": 647946,
+  "columns": [
+    "交易日期",
+    "股票代码",
+    "股票简称",
+    "收盘价",
+    "成交额",
+    "涨跌幅(%)",
+    "换手率(%)",
+    "总市值(亿)",
+    "是否涨停",
+    "连板数"
+  ],
+  "unique_trade_dates": 124,
+  "unique_stock_codes": 5509,
+  "min_trade_date": "2025-10-15",
+  "max_trade_date": "2026-04-17",
+  "parquet_path": "/Users/zijiehe/Desktop/动态打分/data/derived/a_share_main_app.parquet"
+}

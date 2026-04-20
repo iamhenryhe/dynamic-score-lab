@@ -1,0 +1,7 @@
+__pycache__/
+.DS_Store
+.streamlit/secrets.toml
+A股主表.csv
+个股股价包含度_全历史.csv
+板块容量打分_全历史.csv
+*.pyc
