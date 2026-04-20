@@ -34,7 +34,7 @@ from scorer import (  # noqa: E402
 )
 
 
-st.set_page_config(page_title="包含度与容量调参实验室", page_icon="📊", layout="wide")
+st.set_page_config(page_title="因子参数调整", page_icon="📊", layout="wide")
 
 
 @st.cache_data(show_spinner="加载数据中...")
@@ -351,7 +351,7 @@ def render_total_tab(
 
 
 def main() -> None:
-    st.title("包含度与容量调参实验室")
+    st.title("因子参数调整")
 
     raw_df, mapping_df, _summary = load_sources_cached()
     available_dates = sorted(pd.to_datetime(raw_df["交易日期"]).dt.normalize().unique(), reverse=True)
