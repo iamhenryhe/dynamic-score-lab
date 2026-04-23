@@ -11,12 +11,10 @@ WORKSPACE_ROOT = Path(__file__).resolve().parents[1]
 if str(WORKSPACE_ROOT) not in sys.path:
     sys.path.insert(0, str(WORKSPACE_ROOT))
 
-from scorer import (  # noqa: E402
-    APP_PARQUET_PATH,
+from scorer.engine import (  # noqa: E402
     CapacityConfig,
     CoverageConfig,
     TotalConfig,
-    build_app_dataset,
     calculate_capacity_scores,
     calculate_coverage_scores,
     calculate_total_scores,
@@ -26,12 +24,16 @@ from scorer import (  # noqa: E402
     default_coverage_config,
     default_total_config,
     ensure_feature_columns,
+    total_formula_markdown,
+)
+from scorer.io import (  # noqa: E402
+    APP_PARQUET_PATH,
+    build_app_dataset,
     ensure_mapping_file,
     load_app_dataset,
     load_dataset_summary,
     load_mapping_table,
     load_propagation_history,
-    total_formula_markdown,
 )
 
 
