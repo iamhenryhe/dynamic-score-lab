@@ -30,6 +30,7 @@ from scorer import (  # noqa: E402
     load_app_dataset,
     load_dataset_summary,
     load_mapping_table,
+    load_propagation_history,
     total_formula_markdown,
 )
 
@@ -38,15 +39,15 @@ st.set_page_config(page_title="因子参数调整", page_icon="📊", layout="wi
 
 
 @st.cache_data(show_spinner="加载数据中...")
-def load_sources_cached() -> tuple[pd.DataFrame, pd.DataFrame, dict[str, object]]:
+def load_sources_cached() -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict[str, object]]:
     ensure_mapping_file()
     if not APP_PARQUET_PATH.exists():
         build_app_dataset()
-    return load_app_dataset(), load_mapping_table(), load_dataset_summary()
+    return load_app_dataset(), load_mapping_table(), load_propagation_history(), load_dataset_summary()
 
 
 @st.cache_data(show_spinner="计算历史窗口中...")
-def build_feature_frame_cached(windows: tuple[int, ...]) -> pd.DataFrame:
+def build_feature_frame_cached(windows: tuple[int, ...], dataset_signature: tuple[object, ...]) -> pd.DataFrame:
     raw_df = load_app_dataset()
     return ensure_feature_columns(raw_df, set(windows))
 
@@ -107,13 +108,15 @@ def build_capacity_panel() -> CapacityConfig:
 
 def build_total_panel() -> TotalConfig:
     panel = st.sidebar.expander("总分参数", expanded=False)
-    coverage_weight_percent = panel.slider("总分中包含度权重", min_value=0, max_value=100, value=25, step=1, key="total_cov_weight_percent")
-    capacity_weight_percent = panel.slider("总分中容量权重", min_value=0, max_value=100, value=25, step=1, key="total_cap_weight_percent")
+    propagation_multiplier = panel.number_input("传播度放大倍数", min_value=0.0, max_value=20.0, value=2.5, step=0.1, key="total_prop_multiplier")
+    propagation_weight_percent = panel.slider("总分中传播度权重", min_value=0, max_value=100, value=70, step=1, key="total_prop_weight_percent")
+    coverage_weight_percent = panel.slider("总分中包含度权重", min_value=0, max_value=100, value=15, step=1, key="total_cov_weight_percent")
+    capacity_weight_percent = panel.slider("总分中容量权重", min_value=0, max_value=100, value=15, step=1, key="total_cap_weight_percent")
     return TotalConfig(
         coverage_weight=float(coverage_weight_percent) / 100,
         capacity_weight=float(capacity_weight_percent) / 100,
-        propagation_weight=0.5,
-        propagation_score=0.0,
+        propagation_weight=float(propagation_weight_percent) / 100,
+        propagation_multiplier=float(propagation_multiplier),
     )
 
 
@@ -300,11 +303,12 @@ def render_total_tab(
     baseline_coverage_board: pd.DataFrame,
     tuned_capacity_df: pd.DataFrame,
     baseline_capacity_df: pd.DataFrame,
+    propagation_df: pd.DataFrame,
     total_config: TotalConfig,
 ) -> None:
     baseline_config = default_total_config()
-    tuned_total = calculate_total_scores(tuned_coverage_board, tuned_capacity_df, total_config)
-    baseline_total = calculate_total_scores(baseline_coverage_board, baseline_capacity_df, baseline_config)
+    tuned_total = calculate_total_scores(tuned_coverage_board, tuned_capacity_df, total_config, propagation_df)
+    baseline_total = calculate_total_scores(baseline_coverage_board, baseline_capacity_df, baseline_config, propagation_df)
 
     formula_reference_box(
         "总分公式参考",
@@ -314,19 +318,22 @@ def render_total_tab(
 
     baseline_renamed = baseline_total.rename(
         columns={
+            "传播度": "基准传播度",
+            "传播度放大分": "基准传播度放大分",
             "板块加权包含度得分": "基准板块加权包含度得分",
             "综合容量分": "基准综合容量分",
             "总分": "基准总分",
         }
     )
     compare_df = tuned_total.merge(
-        baseline_renamed[["板块", "基准板块加权包含度得分", "基准综合容量分", "基准总分"]],
+        baseline_renamed[["板块", "基准传播度", "基准传播度放大分", "基准板块加权包含度得分", "基准综合容量分", "基准总分"]],
         on="板块",
         how="left",
     )
     compare_df["总分变化"] = compare_df["总分"] - compare_df["基准总分"]
     compare_df["包含度变化"] = compare_df["板块加权包含度得分"] - compare_df["基准板块加权包含度得分"]
     compare_df["容量变化"] = compare_df["综合容量分"] - compare_df["基准综合容量分"]
+    compare_df["传播度放大分变化"] = compare_df["传播度放大分"] - compare_df["基准传播度放大分"]
 
     st.markdown("**总分变化**")
     st.dataframe(
@@ -334,6 +341,9 @@ def render_total_tab(
             [
                 "板块",
                 "传播度",
+                "传播度放大分",
+                "基准传播度放大分",
+                "传播度放大分变化",
                 "板块加权包含度得分",
                 "基准板块加权包含度得分",
                 "包含度变化",
@@ -350,18 +360,39 @@ def render_total_tab(
     )
 
 
+def match_trade_date(propagation_date: pd.Timestamp, trade_dates: list[pd.Timestamp]) -> pd.Timestamp:
+    selected = pd.Timestamp(propagation_date).normalize()
+    candidates = [pd.Timestamp(item).normalize() for item in trade_dates if pd.Timestamp(item).normalize() <= selected]
+    if not candidates:
+        return pd.Timestamp(trade_dates[-1]).normalize()
+    return max(candidates)
+
+
 def main() -> None:
     st.title("因子参数调整")
 
-    raw_df, mapping_df, _summary = load_sources_cached()
+    raw_df, mapping_df, propagation_history_df, summary = load_sources_cached()
     available_dates = sorted(pd.to_datetime(raw_df["交易日期"]).dt.normalize().unique(), reverse=True)
+    min_trade_date = min(available_dates)
+    propagation_dates = [
+        date
+        for date in sorted(pd.to_datetime(propagation_history_df["传播度日期"]).dropna().dt.normalize().unique(), reverse=True)
+        if pd.Timestamp(date).normalize() >= pd.Timestamp(min_trade_date).normalize()
+    ]
 
     st.sidebar.subheader("全局设置")
-    selected_date = st.sidebar.selectbox(
-        "选择交易日",
-        options=available_dates,
+    date_options = propagation_dates or available_dates
+    selected_propagation_date = st.sidebar.selectbox(
+        "选择传播度日期",
+        options=date_options,
         format_func=lambda x: pd.Timestamp(x).strftime("%Y-%m-%d"),
         index=0,
+    )
+    selected_date = match_trade_date(pd.Timestamp(selected_propagation_date), available_dates)
+    st.caption(
+        f"传播度日期：{pd.Timestamp(selected_propagation_date).strftime('%Y-%m-%d')} | "
+        f"匹配交易日：{pd.Timestamp(selected_date).strftime('%Y-%m-%d')} | "
+        f"主表最新：{summary.get('max_trade_date', '未知')}"
     )
 
     coverage_config = build_coverage_panel()
@@ -376,7 +407,15 @@ def main() -> None:
         default_coverage_config().middle_window,
         default_coverage_config().long_window,
     }
-    feature_df = build_feature_frame_cached(tuple(sorted(feature_windows)))
+    dataset_signature = (
+        summary.get("rows"),
+        summary.get("max_trade_date"),
+        summary.get("source_csv_mtime_ns"),
+    )
+    feature_df = build_feature_frame_cached(tuple(sorted(feature_windows)), dataset_signature)
+    selected_propagation_df = propagation_history_df[
+        pd.to_datetime(propagation_history_df["传播度日期"]).dt.normalize() == pd.Timestamp(selected_propagation_date).normalize()
+    ].copy()
 
     tab1, tab2, tab3 = st.tabs(["股价包含度", "板块容量", "总分"])
 
@@ -402,6 +441,7 @@ def main() -> None:
             baseline_coverage_board,
             tuned_capacity_df,
             baseline_capacity_df,
+            selected_propagation_df,
             total_config,
         )
 

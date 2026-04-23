@@ -1,5 +1,5 @@
 {
-  "rows": 647946,
+  "rows": 664434,
   "columns": [
     "交易日期",
     "股票代码",
@@ -12,9 +12,11 @@
     "是否涨停",
     "连板数"
   ],
-  "unique_trade_dates": 124,
-  "unique_stock_codes": 5509,
+  "unique_trade_dates": 127,
+  "unique_stock_codes": 5512,
   "min_trade_date": "2025-10-15",
-  "max_trade_date": "2026-04-17",
-  "parquet_path": "/Users/zijiehe/Desktop/动态打分/data/derived/a_share_main_app.parquet"
+  "max_trade_date": "2026-04-22",
+  "parquet_path": "/Users/zijiehe/Desktop/动态打分/data/derived/a_share_main_app.parquet",
+  "mapping_path": "/Users/zijiehe/Desktop/动态打分/data/raw/板块映射表.csv",
+  "source_csv_mtime_ns": 1776851068514404326
 }

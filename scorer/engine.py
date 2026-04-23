@@ -45,7 +45,7 @@ class TotalConfig:
     coverage_weight: float = 0.25
     capacity_weight: float = 0.25
     propagation_weight: float = 0.5
-    propagation_score: float = 0.0
+    propagation_multiplier: float = 1.0
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -314,6 +314,7 @@ def calculate_total_scores(
     coverage_board_df: pd.DataFrame,
     capacity_df: pd.DataFrame,
     config: TotalConfig,
+    propagation_df: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     coverage_view = coverage_board_df[["板块", "板块加权包含度得分", "板块平均包含度得分"]].copy()
     capacity_view = capacity_df[
@@ -326,9 +327,22 @@ def calculate_total_scores(
         ]
     ].copy()
     merged = capacity_view.merge(coverage_view, on="板块", how="left")
-    merged["传播度"] = float(config.propagation_score)
+    if propagation_df is not None and not propagation_df.empty:
+        propagation_view = propagation_df[["板块", "传播度"]].copy()
+        propagation_view["板块"] = propagation_view["板块"].astype("string").fillna("").str.strip()
+        propagation_view["传播度"] = pd.to_numeric(propagation_view["传播度"], errors="coerce").fillna(0)
+        propagation_view = propagation_view.groupby("板块", as_index=False)["传播度"].max()
+        merged = merged.merge(propagation_view, on="板块", how="left")
+    else:
+        merged["传播度"] = 0.0
+    merged["传播度"] = pd.to_numeric(merged["传播度"], errors="coerce").fillna(0)
+    merged["传播度放大分"] = clip_series(
+        merged["传播度"] * float(config.propagation_multiplier),
+        0.0,
+        100.0,
+    )
     merged["总分"] = clip_series(
-        merged["传播度"] * float(config.propagation_weight)
+        merged["传播度放大分"] * float(config.propagation_weight)
         + pd.to_numeric(merged["板块加权包含度得分"], errors="coerce").fillna(0) * float(config.coverage_weight)
         + pd.to_numeric(merged["综合容量分"], errors="coerce").fillna(0) * float(config.capacity_weight),
         0.0,
@@ -432,6 +446,6 @@ def capacity_formula_markdown(config: CapacityConfig) -> str:
 def total_formula_markdown(config: TotalConfig) -> str:
     return (
         "- 原始总分：`传播度 * 50% + 股价包含度得分 * 25% + 板块容量得分 * 25%`\n"
-        f"- 当前传播度：`{config.propagation_score}`\n"
-        f"- 当前总分：`板块加权包含度得分 * {format_weight_percent(config.coverage_weight)} + 综合容量分 * {format_weight_percent(config.capacity_weight)}`"
+        f"- 传播度放大分：`传播度 * {config.propagation_multiplier}`\n"
+        f"- 当前总分：`传播度放大分 * {format_weight_percent(config.propagation_weight)} + 板块加权包含度得分 * {format_weight_percent(config.coverage_weight)} + 综合容量分 * {format_weight_percent(config.capacity_weight)}`"
     )

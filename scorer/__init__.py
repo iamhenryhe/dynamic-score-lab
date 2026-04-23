@@ -18,12 +18,15 @@ from .io import (
     APP_SUMMARY_PATH,
     EXTERNAL_MAPPING_SOURCE,
     LOCAL_MAPPING_PATH,
+    PROPAGATION_DIR,
     RAW_MAIN_CSV_PATH,
+    app_dataset_needs_rebuild,
     build_app_dataset,
     ensure_mapping_file,
     load_app_dataset,
     load_dataset_summary,
     load_mapping_table,
+    load_propagation_history,
 )
 
 __all__ = [
@@ -31,10 +34,12 @@ __all__ = [
     "APP_SUMMARY_PATH",
     "EXTERNAL_MAPPING_SOURCE",
     "LOCAL_MAPPING_PATH",
+    "PROPAGATION_DIR",
     "RAW_MAIN_CSV_PATH",
     "CapacityConfig",
     "CoverageConfig",
     "TotalConfig",
+    "app_dataset_needs_rebuild",
     "build_app_dataset",
     "calculate_capacity_scores",
     "calculate_coverage_scores",
@@ -49,5 +54,6 @@ __all__ = [
     "load_app_dataset",
     "load_dataset_summary",
     "load_mapping_table",
+    "load_propagation_history",
     "total_formula_markdown",
 ]

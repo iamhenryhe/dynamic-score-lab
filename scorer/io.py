@@ -11,6 +11,7 @@ WORKSPACE_ROOT = Path(__file__).resolve().parents[1]
 RAW_MAIN_CSV_PATH = WORKSPACE_ROOT / "A股主表.csv"
 EXTERNAL_MAPPING_SOURCE = Path("/Users/zijiehe/Desktop/a/板块映射表.csv")
 WORKSPACE_MAPPING_PATH = WORKSPACE_ROOT / "板块映射表.csv"
+PROPAGATION_DIR = WORKSPACE_ROOT / "cbd"
 APP_DATA_DIR = WORKSPACE_ROOT / "data" / "derived"
 RAW_DATA_DIR = WORKSPACE_ROOT / "data" / "raw"
 LOCAL_MAPPING_PATH = RAW_DATA_DIR / "板块映射表.csv"
@@ -81,6 +82,17 @@ def ensure_mapping_file() -> Path:
     return LOCAL_MAPPING_PATH
 
 
+def app_dataset_needs_rebuild(
+    source_csv: Path = RAW_MAIN_CSV_PATH,
+    output_parquet: Path = APP_PARQUET_PATH,
+) -> bool:
+    if not output_parquet.exists():
+        return True
+    if not source_csv.exists():
+        return False
+    return source_csv.stat().st_mtime_ns > output_parquet.stat().st_mtime_ns
+
+
 def build_app_dataset(
     source_csv: Path = RAW_MAIN_CSV_PATH,
     output_parquet: Path = APP_PARQUET_PATH,
@@ -114,13 +126,14 @@ def build_app_dataset(
         "max_trade_date": df["交易日期"].max().strftime("%Y-%m-%d"),
         "parquet_path": str(output_parquet),
         "mapping_path": str(LOCAL_MAPPING_PATH),
+        "source_csv_mtime_ns": source_csv.stat().st_mtime_ns,
     }
     summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     return summary
 
 
 def load_app_dataset(parquet_path: Path = APP_PARQUET_PATH) -> pd.DataFrame:
-    if not parquet_path.exists():
+    if app_dataset_needs_rebuild(output_parquet=parquet_path):
         build_app_dataset(output_parquet=parquet_path)
     return pd.read_parquet(parquet_path)
 
@@ -149,6 +162,55 @@ def load_mapping_table(mapping_path: Path | None = None) -> pd.DataFrame:
 
 
 def load_dataset_summary(summary_path: Path = APP_SUMMARY_PATH) -> dict[str, object]:
-    if not summary_path.exists():
+    if not summary_path.exists() or app_dataset_needs_rebuild():
         return build_app_dataset(summary_path=summary_path)
     return json.loads(summary_path.read_text(encoding="utf-8"))
+
+
+def _extract_date_from_cbd_filename(path: Path) -> pd.Timestamp | pd.NaT:
+    match = re.search(r"(\d{4}-\d{2}-\d{2})", path.name)
+    if not match:
+        return pd.NaT
+    return pd.to_datetime(match.group(1), errors="coerce")
+
+
+def load_propagation_history(cbd_dir: Path = PROPAGATION_DIR) -> pd.DataFrame:
+    if not cbd_dir.exists():
+        return pd.DataFrame(columns=["传播度日期", "板块", "传播度"])
+
+    frames: list[pd.DataFrame] = []
+    for path in sorted(cbd_dir.glob("t-*.csv")):
+        propagation_date = _extract_date_from_cbd_filename(path)
+        if pd.isna(propagation_date):
+            continue
+
+        df = pd.read_csv(path, encoding="utf-8-sig", low_memory=False)
+        rename_map = {}
+        if "sector" in df.columns:
+            rename_map["sector"] = "板块"
+        if "total_score" in df.columns:
+            rename_map["total_score"] = "传播度"
+        if "得分" in df.columns and "传播度" not in df.columns:
+            rename_map["得分"] = "传播度"
+        df = df.rename(columns=rename_map)
+        if not {"板块", "传播度"}.issubset(df.columns):
+            continue
+
+        part = df[["板块", "传播度"]].copy()
+        part["传播度日期"] = pd.Timestamp(propagation_date).normalize()
+        part["板块"] = part["板块"].astype("string").fillna("").str.strip()
+        part["传播度"] = pd.to_numeric(part["传播度"], errors="coerce").fillna(0)
+        part = part[part["板块"] != ""].copy()
+        frames.append(part[["传播度日期", "板块", "传播度"]])
+
+    if not frames:
+        return pd.DataFrame(columns=["传播度日期", "板块", "传播度"])
+
+    history = pd.concat(frames, ignore_index=True)
+    history = (
+        history.groupby(["传播度日期", "板块"], as_index=False)["传播度"]
+        .max()
+        .sort_values(["传播度日期", "传播度", "板块"], ascending=[False, False, True])
+        .reset_index(drop=True)
+    )
+    return history
