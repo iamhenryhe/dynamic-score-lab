@@ -25,14 +25,16 @@ class CoverageConfig:
 @dataclass(frozen=True)
 class CapacityConfig:
     static_market_cap_divisor: float = 125000.0
+    turnover_share_full_score_ratio: float = 0.10
+    turnover_share_weight: float = 0.5
     limit_up_count_multiplier: float = 1.0
     limit_up_market_cap_divisor: float = 50000.0
     limit_up_turnover_divisor: float = 3000.0
-    limit_up_count_weight: float = 0.4
+    limit_up_count_weight: float = 0.3
     limit_up_market_cap_weight: float = 0.2
-    limit_up_turnover_weight: float = 0.4
-    final_dynamic_weight: float = 0.5
-    final_static_weight: float = 0.5
+    limit_up_turnover_weight: float = 0.2
+    final_dynamic_weight: float = 0.8
+    final_static_weight: float = 0.2
     score_floor: float = 0.0
     score_ceiling: float = 100.0
 
@@ -42,9 +44,9 @@ class CapacityConfig:
 
 @dataclass(frozen=True)
 class TotalConfig:
-    coverage_weight: float = 0.25
+    coverage_weight: float = 0.2
     capacity_weight: float = 0.25
-    propagation_weight: float = 0.5
+    propagation_weight: float = 0.55
     propagation_multiplier: float = 1.0
 
     def to_dict(self) -> dict[str, object]:
@@ -79,6 +81,18 @@ def weighted_average_frame(parts: list[tuple[pd.Series, float]]) -> pd.Series:
     numerator = sum(series * weight for series, weight in valid_parts)
     denominator = sum(weight for _, weight in valid_parts)
     return numerator / denominator
+
+
+def weighted_sum_frame(parts: list[tuple[pd.Series, float]]) -> pd.Series:
+    valid_parts = [
+        (pd.to_numeric(series, errors="coerce").fillna(0), float(weight))
+        for series, weight in parts
+        if float(weight) > 0
+    ]
+    if not valid_parts:
+        reference = parts[0][0] if parts else pd.Series(dtype="float64")
+        return pd.Series(0.0, index=reference.index, dtype="float64")
+    return sum(series * weight for series, weight in valid_parts)
 
 
 def ensure_feature_columns(df: pd.DataFrame, windows: set[int]) -> pd.DataFrame:
@@ -222,14 +236,24 @@ def calculate_capacity_scores(
         merged["股票简称"],
     )
     merged["成交额(亿)"] = pd.to_numeric(merged["成交额"], errors="coerce") / 100000000
+    total_turnover = pd.to_numeric(selected_main["成交额"], errors="coerce").fillna(0).sum() / 100000000
 
     static_df = (
         merged.groupby("板块", as_index=False)
         .agg(
             板块股票数=("股票代码", "nunique"),
             板块总市值_亿=("总市值(亿)", "sum"),
+            板块成交额_亿=("成交额(亿)", "sum"),
         )
         .copy()
+    )
+    static_df["成交占比"] = 0.0
+    if total_turnover > 0:
+        static_df["成交占比"] = pd.to_numeric(static_df["板块成交额_亿"], errors="coerce").fillna(0) / total_turnover
+    static_df["成交占比得分"] = clip_series(
+        static_df["成交占比"] / config.turnover_share_full_score_ratio * 100,
+        config.score_floor,
+        config.score_ceiling,
     )
     static_df["静态容量分"] = clip_series(
         static_df["板块总市值_亿"] / config.static_market_cap_divisor * 100,
@@ -271,32 +295,35 @@ def calculate_capacity_scores(
         config.score_floor,
         config.score_ceiling,
     )
-    dynamic_df["动态容量分"] = clip_series(
-        weighted_average_frame(
-            [
-                (dynamic_df["涨停家数得分"], config.limit_up_count_weight),
-                (dynamic_df["涨停股总市值得分"], config.limit_up_market_cap_weight),
-                (dynamic_df["涨停股成交额得分"], config.limit_up_turnover_weight),
-            ]
-        ),
-        config.score_floor,
-        config.score_ceiling,
-    )
 
     score_df = static_df.merge(dynamic_df, on="板块", how="left")
     for col in [
+        "板块成交额_亿",
+        "成交占比",
+        "成交占比得分",
         "涨停家数",
         "涨停股总市值_亿",
         "涨停股成交额_亿",
         "涨停家数得分",
         "涨停股总市值得分",
         "涨停股成交额得分",
-        "动态容量分",
     ]:
         score_df[col] = pd.to_numeric(score_df[col], errors="coerce").fillna(0)
     score_df["涨停股票简称列表"] = score_df["涨停股票简称列表"].fillna("")
+    score_df["动态容量分"] = clip_series(
+        weighted_sum_frame(
+            [
+                (score_df["成交占比得分"], config.turnover_share_weight),
+                (score_df["涨停家数得分"], config.limit_up_count_weight),
+                (score_df["涨停股总市值得分"], config.limit_up_market_cap_weight),
+                (score_df["涨停股成交额得分"], config.limit_up_turnover_weight),
+            ]
+        ),
+        config.score_floor,
+        config.score_ceiling,
+    )
     score_df["综合容量分"] = clip_series(
-        weighted_average_frame(
+        weighted_sum_frame(
             [
                 (score_df["动态容量分"], config.final_dynamic_weight),
                 (score_df["静态容量分"], config.final_static_weight),
@@ -422,30 +449,19 @@ def coverage_formula_markdown(config: CoverageConfig) -> str:
 
 
 def capacity_formula_markdown(config: CapacityConfig) -> str:
-    dynamic_weights = [
-        config.limit_up_count_weight,
-        config.limit_up_market_cap_weight,
-        config.limit_up_turnover_weight,
-    ]
-    count_percent = normalized_weight_percent(config.limit_up_count_weight, dynamic_weights)
-    market_cap_percent = normalized_weight_percent(config.limit_up_market_cap_weight, dynamic_weights)
-    turnover_percent = normalized_weight_percent(config.limit_up_turnover_weight, dynamic_weights)
-    final_weights = [config.final_dynamic_weight, config.final_static_weight]
-    dynamic_percent = normalized_weight_percent(config.final_dynamic_weight, final_weights)
-    static_percent = normalized_weight_percent(config.final_static_weight, final_weights)
     return (
         f"- 静态容量分：`板块总市值_亿 / {config.static_market_cap_divisor} * 100`\n"
+        f"- 成交占比得分：`成交占比 / {format_weight_percent(config.turnover_share_full_score_ratio)} * 100`\n"
         f"- 涨停家数得分：`涨停家数 * {config.limit_up_count_multiplier}`\n"
         f"- 涨停股总市值得分：`涨停股总市值_亿 / {config.limit_up_market_cap_divisor} * 100`\n"
         f"- 涨停股成交额得分：`涨停股成交额_亿 / {config.limit_up_turnover_divisor} * 100`\n"
-        f"- 动态容量分：`涨停家数得分 * {count_percent} + 涨停股总市值得分 * {market_cap_percent} + 涨停股成交额得分 * {turnover_percent}`\n"
-        f"- 综合容量分：`动态容量分 * {dynamic_percent} + 静态容量分 * {static_percent}`"
+        f"- 动态容量分：`成交占比得分 * {format_weight_percent(config.turnover_share_weight)} + 涨停家数得分 * {format_weight_percent(config.limit_up_count_weight)} + 涨停股总市值得分 * {format_weight_percent(config.limit_up_market_cap_weight)} + 涨停股成交额得分 * {format_weight_percent(config.limit_up_turnover_weight)}`\n"
+        f"- 综合容量分：`动态容量分 * {format_weight_percent(config.final_dynamic_weight)} + 静态容量分 * {format_weight_percent(config.final_static_weight)}`"
     )
 
 
 def total_formula_markdown(config: TotalConfig) -> str:
     return (
-        "- 原始总分：`传播度 * 50% + 股价包含度得分 * 25% + 板块容量得分 * 25%`\n"
         f"- 传播度放大分：`传播度 * {config.propagation_multiplier}`\n"
-        f"- 当前总分：`传播度放大分 * {format_weight_percent(config.propagation_weight)} + 板块加权包含度得分 * {format_weight_percent(config.coverage_weight)} + 综合容量分 * {format_weight_percent(config.capacity_weight)}`"
+        f"- 板块总分：`传播度放大分 * {format_weight_percent(config.propagation_weight)} + 板块加权包含度得分 * {format_weight_percent(config.coverage_weight)} + 板块容量得分 * {format_weight_percent(config.capacity_weight)}`"
     )
