@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 
@@ -33,11 +34,89 @@ from scorer.io import (  # noqa: E402
     load_app_dataset,
     load_dataset_summary,
     load_mapping_table,
-    load_propagation_history,
 )
 
 
 st.set_page_config(page_title="因子参数调整", page_icon="📊", layout="wide")
+
+
+def _extract_date_from_cbd_filename(path: Path) -> pd.Timestamp | pd.NaT:
+    match = re.search(r"(\d{4}-\d{2}-\d{2})", path.name)
+    if not match:
+        return pd.NaT
+    return pd.to_datetime(match.group(1), errors="coerce")
+
+
+def load_propagation_history() -> pd.DataFrame:
+    cbd_dir = WORKSPACE_ROOT / "cbd"
+    if not cbd_dir.exists():
+        return pd.DataFrame(columns=["传播度日期", "板块", "传播度"])
+
+    frames: list[pd.DataFrame] = []
+    for path in sorted(cbd_dir.glob("t-*.csv")):
+        propagation_date = _extract_date_from_cbd_filename(path)
+        if pd.isna(propagation_date):
+            continue
+
+        df = pd.read_csv(path, encoding="utf-8-sig", low_memory=False)
+        rename_map = {}
+        if "sector" in df.columns:
+            rename_map["sector"] = "板块"
+        if "total_score" in df.columns:
+            rename_map["total_score"] = "传播度"
+        if "得分" in df.columns and "传播度" not in df.columns:
+            rename_map["得分"] = "传播度"
+        df = df.rename(columns=rename_map)
+        if not {"板块", "传播度"}.issubset(df.columns):
+            continue
+
+        part = df[["板块", "传播度"]].copy()
+        part["传播度日期"] = pd.Timestamp(propagation_date).normalize()
+        part["板块"] = part["板块"].astype("string").fillna("").str.strip()
+        part["传播度"] = pd.to_numeric(part["传播度"], errors="coerce").fillna(0)
+        frames.append(part[part["板块"] != ""][["传播度日期", "板块", "传播度"]])
+
+    if not frames:
+        return pd.DataFrame(columns=["传播度日期", "板块", "传播度"])
+
+    return (
+        pd.concat(frames, ignore_index=True)
+        .groupby(["传播度日期", "板块"], as_index=False)["传播度"]
+        .max()
+        .sort_values(["传播度日期", "传播度", "板块"], ascending=[False, False, True])
+        .reset_index(drop=True)
+    )
+
+
+def calculate_total_scores_compat(
+    coverage_board_df: pd.DataFrame,
+    capacity_df: pd.DataFrame,
+    config: TotalConfig,
+    propagation_df: pd.DataFrame,
+) -> pd.DataFrame:
+    try:
+        return calculate_total_scores(coverage_board_df, capacity_df, config, propagation_df)
+    except TypeError:
+        coverage_view = coverage_board_df[["板块", "板块加权包含度得分", "板块平均包含度得分"]].copy()
+        capacity_view = capacity_df[["交易日期", "板块", "静态容量分", "动态容量分", "综合容量分"]].copy()
+        merged = capacity_view.merge(coverage_view, on="板块", how="left")
+        if not propagation_df.empty:
+            propagation_view = propagation_df[["板块", "传播度"]].copy()
+            propagation_view["板块"] = propagation_view["板块"].astype("string").fillna("").str.strip()
+            propagation_view["传播度"] = pd.to_numeric(propagation_view["传播度"], errors="coerce").fillna(0)
+            propagation_view = propagation_view.groupby("板块", as_index=False)["传播度"].max()
+            merged = merged.merge(propagation_view, on="板块", how="left")
+        else:
+            merged["传播度"] = 0.0
+        merged["传播度"] = pd.to_numeric(merged["传播度"], errors="coerce").fillna(0)
+        propagation_multiplier = getattr(config, "propagation_multiplier", 1.0)
+        merged["传播度放大分"] = (merged["传播度"] * float(propagation_multiplier)).clip(lower=0, upper=100)
+        merged["总分"] = (
+            merged["传播度放大分"] * float(config.propagation_weight)
+            + pd.to_numeric(merged["板块加权包含度得分"], errors="coerce").fillna(0) * float(config.coverage_weight)
+            + pd.to_numeric(merged["综合容量分"], errors="coerce").fillna(0) * float(config.capacity_weight)
+        ).clip(lower=0, upper=100)
+        return merged.sort_values(["总分", "板块"], ascending=[False, True]).reset_index(drop=True)
 
 
 @st.cache_data(show_spinner="加载数据中...")
@@ -114,12 +193,17 @@ def build_total_panel() -> TotalConfig:
     propagation_weight_percent = panel.slider("总分中传播度权重", min_value=0, max_value=100, value=70, step=1, key="total_prop_weight_percent")
     coverage_weight_percent = panel.slider("总分中包含度权重", min_value=0, max_value=100, value=15, step=1, key="total_cov_weight_percent")
     capacity_weight_percent = panel.slider("总分中容量权重", min_value=0, max_value=100, value=15, step=1, key="total_cap_weight_percent")
-    return TotalConfig(
-        coverage_weight=float(coverage_weight_percent) / 100,
-        capacity_weight=float(capacity_weight_percent) / 100,
-        propagation_weight=float(propagation_weight_percent) / 100,
-        propagation_multiplier=float(propagation_multiplier),
-    )
+    kwargs = {
+        "coverage_weight": float(coverage_weight_percent) / 100,
+        "capacity_weight": float(capacity_weight_percent) / 100,
+        "propagation_weight": float(propagation_weight_percent) / 100,
+    }
+    try:
+        return TotalConfig(**kwargs, propagation_multiplier=float(propagation_multiplier))
+    except TypeError:
+        config = TotalConfig(**kwargs, propagation_score=0.0)
+        object.__setattr__(config, "propagation_multiplier", float(propagation_multiplier))
+        return config
 
 
 def formula_reference_box(title: str, baseline_markdown: str, tuned_markdown: str) -> None:
@@ -309,8 +393,8 @@ def render_total_tab(
     total_config: TotalConfig,
 ) -> None:
     baseline_config = default_total_config()
-    tuned_total = calculate_total_scores(tuned_coverage_board, tuned_capacity_df, total_config, propagation_df)
-    baseline_total = calculate_total_scores(baseline_coverage_board, baseline_capacity_df, baseline_config, propagation_df)
+    tuned_total = calculate_total_scores_compat(tuned_coverage_board, tuned_capacity_df, total_config, propagation_df)
+    baseline_total = calculate_total_scores_compat(baseline_coverage_board, baseline_capacity_df, baseline_config, propagation_df)
 
     formula_reference_box(
         "总分公式参考",
