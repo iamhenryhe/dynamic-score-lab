@@ -40,6 +40,180 @@ from scorer.io import (  # noqa: E402
 st.set_page_config(page_title="因子参数调整", page_icon="📊", layout="wide")
 
 
+def format_weight_percent(weight: float) -> str:
+    return f"{float(weight) * 100:.0f}%"
+
+
+def ensure_capacity_config_compat(config: CapacityConfig) -> CapacityConfig:
+    defaults = {
+        "turnover_share_full_score_ratio": 0.10,
+        "turnover_share_weight": 0.5,
+        "limit_up_count_weight": 0.3,
+        "limit_up_market_cap_weight": 0.2,
+        "limit_up_turnover_weight": 0.2,
+        "final_dynamic_weight": 0.8,
+        "final_static_weight": 0.2,
+        "score_floor": 0.0,
+        "score_ceiling": 100.0,
+    }
+    for key, value in defaults.items():
+        if not hasattr(config, key):
+            object.__setattr__(config, key, value)
+    return config
+
+
+def clip_series_local(series: pd.Series, lower: float, upper: float) -> pd.Series:
+    return pd.to_numeric(series, errors="coerce").fillna(0).clip(lower=lower, upper=upper)
+
+
+def weighted_sum_series(parts: list[tuple[pd.Series, float]]) -> pd.Series:
+    valid_parts = [
+        (pd.to_numeric(series, errors="coerce").fillna(0), float(weight))
+        for series, weight in parts
+        if float(weight) > 0
+    ]
+    if not valid_parts:
+        reference = parts[0][0] if parts else pd.Series(dtype="float64")
+        return pd.Series(0.0, index=reference.index, dtype="float64")
+    return sum(series * weight for series, weight in valid_parts)
+
+
+def capacity_formula_markdown_compat(config: CapacityConfig) -> str:
+    config = ensure_capacity_config_compat(config)
+    return (
+        f"- 静态容量分：`板块总市值_亿 / {config.static_market_cap_divisor} * 100`\n"
+        f"- 成交占比得分：`成交占比 / {format_weight_percent(config.turnover_share_full_score_ratio)} * 100`\n"
+        f"- 涨停家数得分：`涨停家数 * {config.limit_up_count_multiplier}`\n"
+        f"- 涨停股总市值得分：`涨停股总市值_亿 / {config.limit_up_market_cap_divisor} * 100`\n"
+        f"- 涨停股成交额得分：`涨停股成交额_亿 / {config.limit_up_turnover_divisor} * 100`\n"
+        f"- 动态容量分：`成交占比得分 * {format_weight_percent(config.turnover_share_weight)} + 涨停家数得分 * {format_weight_percent(config.limit_up_count_weight)} + 涨停股总市值得分 * {format_weight_percent(config.limit_up_market_cap_weight)} + 涨停股成交额得分 * {format_weight_percent(config.limit_up_turnover_weight)}`\n"
+        f"- 综合容量分：`动态容量分 * {format_weight_percent(config.final_dynamic_weight)} + 静态容量分 * {format_weight_percent(config.final_static_weight)}`"
+    )
+
+
+def calculate_capacity_scores_compat(
+    main_df: pd.DataFrame,
+    mapping_df: pd.DataFrame,
+    trade_date: pd.Timestamp,
+    config: CapacityConfig,
+) -> pd.DataFrame:
+    config = ensure_capacity_config_compat(config)
+    try:
+        scored = calculate_capacity_scores(main_df, mapping_df, trade_date, config)
+        if {"成交占比得分", "动态容量分", "综合容量分"}.issubset(scored.columns):
+            return scored
+    except Exception:
+        pass
+
+    selected_date = pd.Timestamp(trade_date).normalize()
+    selected_main = main_df[main_df["交易日期"] == selected_date].copy()
+    merged = selected_main.merge(mapping_df, on="股票代码", how="inner", suffixes=("_主表", "_映射"))
+    mapping_name_col = "简称_映射" if "简称_映射" in merged.columns else "简称"
+    merged["股票简称"] = merged[mapping_name_col].where(
+        merged[mapping_name_col].astype("string").fillna("").str.strip() != "",
+        merged["股票简称"],
+    )
+    merged["成交额(亿)"] = pd.to_numeric(merged["成交额"], errors="coerce").fillna(0) / 100000000
+    total_turnover = pd.to_numeric(selected_main["成交额"], errors="coerce").fillna(0).sum() / 100000000
+
+    static_df = (
+        merged.groupby("板块", as_index=False)
+        .agg(
+            板块股票数=("股票代码", "nunique"),
+            板块总市值_亿=("总市值(亿)", "sum"),
+            板块成交额_亿=("成交额(亿)", "sum"),
+        )
+        .copy()
+    )
+    static_df["成交占比"] = 0.0
+    if total_turnover > 0:
+        static_df["成交占比"] = pd.to_numeric(static_df["板块成交额_亿"], errors="coerce").fillna(0) / total_turnover
+    static_df["成交占比得分"] = clip_series_local(
+        static_df["成交占比"] / config.turnover_share_full_score_ratio * 100,
+        config.score_floor,
+        config.score_ceiling,
+    )
+    static_df["静态容量分"] = clip_series_local(
+        pd.to_numeric(static_df["板块总市值_亿"], errors="coerce").fillna(0) / config.static_market_cap_divisor * 100,
+        config.score_floor,
+        config.score_ceiling,
+    )
+
+    zt_df = merged[pd.to_numeric(merged["是否涨停"], errors="coerce").fillna(0) == 1].copy()
+    if zt_df.empty:
+        dynamic_df = static_df[["板块"]].copy()
+        dynamic_df["涨停家数"] = 0
+        dynamic_df["涨停股总市值_亿"] = 0.0
+        dynamic_df["涨停股成交额_亿"] = 0.0
+        dynamic_df["涨停股票简称列表"] = ""
+    else:
+        dynamic_df = (
+            zt_df.groupby("板块", as_index=False)
+            .agg(
+                涨停家数=("股票代码", "nunique"),
+                涨停股总市值_亿=("总市值(亿)", "sum"),
+                涨停股成交额_亿=("成交额(亿)", "sum"),
+                涨停股票简称列表=("股票简称", lambda s: ",".join(sorted(set(s)))),
+            )
+            .copy()
+        )
+
+    dynamic_df["涨停家数得分"] = clip_series_local(
+        pd.to_numeric(dynamic_df["涨停家数"], errors="coerce").fillna(0) * config.limit_up_count_multiplier,
+        config.score_floor,
+        config.score_ceiling,
+    )
+    dynamic_df["涨停股总市值得分"] = clip_series_local(
+        pd.to_numeric(dynamic_df["涨停股总市值_亿"], errors="coerce").fillna(0) / config.limit_up_market_cap_divisor * 100,
+        config.score_floor,
+        config.score_ceiling,
+    )
+    dynamic_df["涨停股成交额得分"] = clip_series_local(
+        pd.to_numeric(dynamic_df["涨停股成交额_亿"], errors="coerce").fillna(0) / config.limit_up_turnover_divisor * 100,
+        config.score_floor,
+        config.score_ceiling,
+    )
+
+    score_df = static_df.merge(dynamic_df, on="板块", how="left")
+    for col in [
+        "板块成交额_亿",
+        "成交占比",
+        "成交占比得分",
+        "涨停家数",
+        "涨停股总市值_亿",
+        "涨停股成交额_亿",
+        "涨停家数得分",
+        "涨停股总市值得分",
+        "涨停股成交额得分",
+    ]:
+        score_df[col] = pd.to_numeric(score_df[col], errors="coerce").fillna(0)
+    score_df["涨停股票简称列表"] = score_df["涨停股票简称列表"].fillna("")
+    score_df["动态容量分"] = clip_series_local(
+        weighted_sum_series(
+            [
+                (score_df["成交占比得分"], config.turnover_share_weight),
+                (score_df["涨停家数得分"], config.limit_up_count_weight),
+                (score_df["涨停股总市值得分"], config.limit_up_market_cap_weight),
+                (score_df["涨停股成交额得分"], config.limit_up_turnover_weight),
+            ]
+        ),
+        config.score_floor,
+        config.score_ceiling,
+    )
+    score_df["综合容量分"] = clip_series_local(
+        weighted_sum_series(
+            [
+                (score_df["动态容量分"], config.final_dynamic_weight),
+                (score_df["静态容量分"], config.final_static_weight),
+            ]
+        ),
+        config.score_floor,
+        config.score_ceiling,
+    )
+    score_df.insert(0, "交易日期", selected_date)
+    return score_df.sort_values(["综合容量分", "涨停家数", "板块"], ascending=[False, False, True]).reset_index(drop=True)
+
+
 def _extract_date_from_cbd_filename(path: Path) -> pd.Timestamp | pd.NaT:
     match = re.search(r"(\d{4}-\d{2}-\d{2})", path.name)
     if not match:
@@ -174,21 +348,30 @@ def build_capacity_panel() -> CapacityConfig:
     final_static_weight = panel.slider("综合分中静态权重", min_value=0.0, max_value=2.0, value=0.2, step=0.05, key="cap_final_static")
     score_floor = panel.number_input("容量单项得分下限", min_value=0.0, max_value=100.0, value=0.0, step=1.0, key="cap_score_floor")
     score_ceiling = panel.number_input("容量单项得分上限", min_value=0.0, max_value=100.0, value=100.0, step=1.0, key="cap_score_ceiling")
-    return CapacityConfig(
-        static_market_cap_divisor=float(static_market_cap_divisor),
-        turnover_share_full_score_ratio=float(turnover_share_full_score_percent) / 100,
-        turnover_share_weight=float(turnover_share_weight),
-        limit_up_count_multiplier=float(limit_up_count_multiplier),
-        limit_up_market_cap_divisor=float(limit_up_market_cap_divisor),
-        limit_up_turnover_divisor=float(limit_up_turnover_divisor),
-        limit_up_count_weight=float(limit_up_count_weight),
-        limit_up_market_cap_weight=float(limit_up_market_cap_weight),
-        limit_up_turnover_weight=float(limit_up_turnover_weight),
-        final_dynamic_weight=float(final_dynamic_weight),
-        final_static_weight=float(final_static_weight),
-        score_floor=float(score_floor),
-        score_ceiling=float(score_ceiling),
-    )
+    kwargs = {
+        "static_market_cap_divisor": float(static_market_cap_divisor),
+        "limit_up_count_multiplier": float(limit_up_count_multiplier),
+        "limit_up_market_cap_divisor": float(limit_up_market_cap_divisor),
+        "limit_up_turnover_divisor": float(limit_up_turnover_divisor),
+        "limit_up_count_weight": float(limit_up_count_weight),
+        "limit_up_market_cap_weight": float(limit_up_market_cap_weight),
+        "limit_up_turnover_weight": float(limit_up_turnover_weight),
+        "final_dynamic_weight": float(final_dynamic_weight),
+        "final_static_weight": float(final_static_weight),
+        "score_floor": float(score_floor),
+        "score_ceiling": float(score_ceiling),
+    }
+    try:
+        config = CapacityConfig(
+            **kwargs,
+            turnover_share_full_score_ratio=float(turnover_share_full_score_percent) / 100,
+            turnover_share_weight=float(turnover_share_weight),
+        )
+    except TypeError:
+        config = CapacityConfig(**kwargs)
+        object.__setattr__(config, "turnover_share_full_score_ratio", float(turnover_share_full_score_percent) / 100)
+        object.__setattr__(config, "turnover_share_weight", float(turnover_share_weight))
+    return ensure_capacity_config_compat(config)
 
 
 def build_total_panel() -> TotalConfig:
@@ -316,14 +499,15 @@ def render_capacity_tab(
     selected_date: pd.Timestamp,
     tuned_config: CapacityConfig,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
-    baseline_config = default_capacity_config()
-    tuned_df = calculate_capacity_scores(raw_df, mapping_df, selected_date, tuned_config)
-    baseline_df = calculate_capacity_scores(raw_df, mapping_df, selected_date, baseline_config)
+    baseline_config = ensure_capacity_config_compat(default_capacity_config())
+    tuned_config = ensure_capacity_config_compat(tuned_config)
+    tuned_df = calculate_capacity_scores_compat(raw_df, mapping_df, selected_date, tuned_config)
+    baseline_df = calculate_capacity_scores_compat(raw_df, mapping_df, selected_date, baseline_config)
 
     formula_reference_box(
         "板块容量公式参考",
-        capacity_formula_markdown(baseline_config),
-        capacity_formula_markdown(tuned_config),
+        capacity_formula_markdown_compat(baseline_config),
+        capacity_formula_markdown_compat(tuned_config),
     )
 
     baseline_renamed = baseline_df.rename(
