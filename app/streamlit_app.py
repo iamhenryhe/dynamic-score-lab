@@ -5,6 +5,7 @@ import sys
 from pathlib import Path
 
 import pandas as pd
+import plotly.express as px
 import streamlit as st
 
 
@@ -291,6 +292,171 @@ def calculate_total_scores_compat(
             + pd.to_numeric(merged["综合容量分"], errors="coerce").fillna(0) * float(config.capacity_weight)
         ).clip(lower=0, upper=100)
         return merged.sort_values(["总分", "板块"], ascending=[False, True]).reset_index(drop=True)
+
+
+def coverage_config_signature(config: CoverageConfig) -> tuple[object, ...]:
+    return (
+        int(config.short_window),
+        int(config.middle_window),
+        int(config.long_window),
+        float(config.score_base),
+        float(config.penalty_slope),
+        float(config.short_weight),
+        float(config.middle_weight),
+        float(config.long_weight),
+        float(config.score_floor),
+        float(config.score_ceiling),
+    )
+
+
+def capacity_config_signature(config: CapacityConfig) -> tuple[object, ...]:
+    config = ensure_capacity_config_compat(config)
+    return (
+        float(config.static_market_cap_divisor),
+        float(config.turnover_share_full_score_ratio),
+        float(config.turnover_share_weight),
+        float(config.limit_up_count_multiplier),
+        float(config.limit_up_market_cap_divisor),
+        float(config.limit_up_turnover_divisor),
+        float(config.limit_up_count_weight),
+        float(config.limit_up_market_cap_weight),
+        float(config.limit_up_turnover_weight),
+        float(config.final_dynamic_weight),
+        float(config.final_static_weight),
+        float(config.score_floor),
+        float(config.score_ceiling),
+    )
+
+
+def total_config_signature(config: TotalConfig) -> tuple[object, ...]:
+    return (
+        float(config.coverage_weight),
+        float(config.capacity_weight),
+        float(config.propagation_weight),
+        float(getattr(config, "propagation_multiplier", 1.0)),
+    )
+
+
+@st.cache_data(show_spinner="计算基准总分中...")
+def build_total_snapshot_cached(
+    propagation_history_df: pd.DataFrame,
+    available_trade_date_keys: tuple[str, ...],
+    propagation_date_key: str,
+    dataset_signature: tuple[object, ...],
+    coverage_signature: tuple[object, ...],
+    capacity_signature: tuple[object, ...],
+    total_signature: tuple[object, ...],
+    _feature_df: pd.DataFrame,
+    _raw_df: pd.DataFrame,
+    _mapping_df: pd.DataFrame,
+    _coverage_config: CoverageConfig,
+    _capacity_config: CapacityConfig,
+    _total_config: TotalConfig,
+) -> pd.DataFrame:
+    del dataset_signature, coverage_signature, capacity_signature, total_signature
+    propagation_date = pd.Timestamp(propagation_date_key).normalize()
+    available_trade_dates = [pd.Timestamp(item).normalize() for item in available_trade_date_keys]
+    matched_trade_date = match_trade_date(propagation_date, available_trade_dates)
+    propagation_df = propagation_history_df[
+        pd.to_datetime(propagation_history_df["传播度日期"]).dt.normalize() == propagation_date
+    ].copy()
+    _, coverage_board = calculate_coverage_scores(_feature_df, _mapping_df, matched_trade_date, _coverage_config)
+    capacity_df = calculate_capacity_scores_compat(_raw_df, _mapping_df, matched_trade_date, _capacity_config)
+    total_df = calculate_total_scores_compat(coverage_board, capacity_df, _total_config, propagation_df)
+    total_df["传播度日期"] = propagation_date
+    total_df["匹配交易日"] = matched_trade_date
+    return total_df
+
+
+@st.cache_data(show_spinner="计算总分趋势中...")
+def build_total_history_frame_cached(
+    propagation_history_df: pd.DataFrame,
+    available_trade_date_keys: tuple[str, ...],
+    history_date_keys: tuple[str, ...],
+    selected_boards: tuple[str, ...],
+    start_date_key: str,
+    end_date_key: str,
+    dataset_signature: tuple[object, ...],
+    coverage_signature: tuple[object, ...],
+    capacity_signature: tuple[object, ...],
+    total_signature: tuple[object, ...],
+    _feature_df: pd.DataFrame,
+    _raw_df: pd.DataFrame,
+    _mapping_df: pd.DataFrame,
+    _coverage_config: CoverageConfig,
+    _capacity_config: CapacityConfig,
+    _total_config: TotalConfig,
+) -> pd.DataFrame:
+    del dataset_signature, coverage_signature, capacity_signature, total_signature
+    if not selected_boards:
+        return pd.DataFrame(
+            columns=["传播度日期", "匹配交易日", "板块", "传播度", "传播度放大分", "板块加权包含度得分", "综合容量分", "总分"]
+        )
+
+    start_date = pd.Timestamp(start_date_key).normalize()
+    end_date = pd.Timestamp(end_date_key).normalize()
+    if start_date > end_date:
+        start_date, end_date = end_date, start_date
+
+    history_dates = [
+        pd.Timestamp(item).normalize()
+        for item in history_date_keys
+        if start_date <= pd.Timestamp(item).normalize() <= end_date
+    ]
+    if not history_dates:
+        return pd.DataFrame(
+            columns=["传播度日期", "匹配交易日", "板块", "传播度", "传播度放大分", "板块加权包含度得分", "综合容量分", "总分"]
+        )
+
+    mapping_filtered = _mapping_df[_mapping_df["板块"].isin(selected_boards)].copy()
+    if mapping_filtered.empty:
+        return pd.DataFrame(
+            columns=["传播度日期", "匹配交易日", "板块", "传播度", "传播度放大分", "板块加权包含度得分", "综合容量分", "总分"]
+        )
+
+    selected_codes = mapping_filtered["股票代码"].astype("string").dropna().unique().tolist()
+    feature_filtered = _feature_df[_feature_df["股票代码"].astype("string").isin(selected_codes)].copy()
+    available_trade_dates = [pd.Timestamp(item).normalize() for item in available_trade_date_keys]
+
+    frames: list[pd.DataFrame] = []
+    for propagation_date in history_dates:
+        matched_trade_date = match_trade_date(propagation_date, available_trade_dates)
+        propagation_df = propagation_history_df[
+            pd.to_datetime(propagation_history_df["传播度日期"]).dt.normalize() == propagation_date
+        ].copy()
+        propagation_df = propagation_df[propagation_df["板块"].isin(selected_boards)].copy()
+        _, coverage_board = calculate_coverage_scores(
+            feature_filtered,
+            mapping_filtered,
+            matched_trade_date,
+            _coverage_config,
+        )
+        capacity_df = calculate_capacity_scores_compat(
+            _raw_df,
+            mapping_filtered,
+            matched_trade_date,
+            _capacity_config,
+        )
+        total_df = calculate_total_scores_compat(coverage_board, capacity_df, _total_config, propagation_df)
+        total_df = total_df[total_df["板块"].isin(selected_boards)].copy()
+        total_df["传播度日期"] = propagation_date
+        total_df["匹配交易日"] = matched_trade_date
+        frames.append(
+            total_df[
+                ["传播度日期", "匹配交易日", "板块", "传播度", "传播度放大分", "板块加权包含度得分", "综合容量分", "总分"]
+            ]
+        )
+
+    if not frames:
+        return pd.DataFrame(
+            columns=["传播度日期", "匹配交易日", "板块", "传播度", "传播度放大分", "板块加权包含度得分", "综合容量分", "总分"]
+        )
+
+    return (
+        pd.concat(frames, ignore_index=True)
+        .sort_values(["传播度日期", "总分", "板块"], ascending=[True, False, True])
+        .reset_index(drop=True)
+    )
 
 
 @st.cache_data(show_spinner="加载数据中...")
@@ -581,11 +747,21 @@ def render_capacity_tab(
 
 
 def render_total_tab(
+    raw_df: pd.DataFrame,
+    feature_df: pd.DataFrame,
+    mapping_df: pd.DataFrame,
+    propagation_history_df: pd.DataFrame,
+    available_dates: list[pd.Timestamp],
+    propagation_dates: list[pd.Timestamp],
+    dataset_signature: tuple[object, ...],
+    selected_propagation_date: pd.Timestamp,
     tuned_coverage_board: pd.DataFrame,
     baseline_coverage_board: pd.DataFrame,
     tuned_capacity_df: pd.DataFrame,
     baseline_capacity_df: pd.DataFrame,
     propagation_df: pd.DataFrame,
+    coverage_config: CoverageConfig,
+    capacity_config: CapacityConfig,
     total_config: TotalConfig,
 ) -> None:
     baseline_config = default_total_config()
@@ -640,6 +816,146 @@ def render_total_tab(
         width="stretch",
         hide_index=True,
     )
+
+    history_date_options = propagation_dates or available_dates
+    history_dates_desc = sorted([pd.Timestamp(item).normalize() for item in history_date_options], reverse=True)
+    history_dates_asc = list(reversed(history_dates_desc))
+    base_date_default = pd.Timestamp(selected_propagation_date).normalize()
+    if base_date_default not in history_dates_desc and history_dates_desc:
+        base_date_default = history_dates_desc[0]
+
+    controls = st.columns([1, 1.4, 1.2, 1.2])
+    top_n_default = min(5, max(len(tuned_total), 1))
+    top_n = int(
+        controls[0].number_input(
+            "Top N",
+            min_value=1,
+            max_value=max(len(tuned_total), 1),
+            value=top_n_default,
+            step=1,
+            key="total_history_top_n",
+        )
+    )
+    topn_base_date = pd.Timestamp(
+        controls[1].selectbox(
+            "TopN基准日期",
+            options=history_dates_desc,
+            index=history_dates_desc.index(base_date_default) if history_dates_desc else 0,
+            format_func=lambda value: pd.Timestamp(value).strftime("%Y-%m-%d"),
+            key="total_history_base_date",
+        )
+    ).normalize()
+    base_date_position = history_dates_asc.index(topn_base_date)
+    default_start_position = max(0, base_date_position - 59)
+    start_date = pd.Timestamp(
+        controls[2].selectbox(
+            "开始时间",
+            options=history_dates_asc[: base_date_position + 1],
+            index=default_start_position,
+            format_func=lambda value: pd.Timestamp(value).strftime("%Y-%m-%d"),
+            key="total_history_start_date",
+        )
+    ).normalize()
+    end_date_candidates = [date for date in history_dates_asc if pd.Timestamp(date).normalize() >= start_date]
+    end_date = pd.Timestamp(
+        controls[3].selectbox(
+            "结束时间",
+            options=end_date_candidates,
+            index=end_date_candidates.index(topn_base_date) if topn_base_date in end_date_candidates else len(end_date_candidates) - 1,
+            format_func=lambda value: pd.Timestamp(value).strftime("%Y-%m-%d"),
+            key="total_history_end_date",
+        )
+    ).normalize()
+
+    coverage_signature = coverage_config_signature(coverage_config)
+    capacity_signature = capacity_config_signature(capacity_config)
+    total_signature = total_config_signature(total_config)
+    available_trade_date_keys = tuple(pd.Timestamp(item).strftime("%Y-%m-%d") for item in sorted(available_dates))
+    history_date_keys = tuple(pd.Timestamp(item).strftime("%Y-%m-%d") for item in history_dates_asc)
+
+    if topn_base_date == pd.Timestamp(selected_propagation_date).normalize():
+        base_total = tuned_total.copy()
+        base_total["传播度日期"] = topn_base_date
+    else:
+        base_total = build_total_snapshot_cached(
+            propagation_history_df,
+            available_trade_date_keys,
+            topn_base_date.strftime("%Y-%m-%d"),
+            dataset_signature,
+            coverage_signature,
+            capacity_signature,
+            total_signature,
+            feature_df,
+            raw_df,
+            mapping_df,
+            coverage_config,
+            capacity_config,
+            total_config,
+        )
+
+    selected_boards = tuple(base_total.head(top_n)["板块"].tolist())
+    st.markdown(
+        f"**总分趋势图**  基准日期：`{topn_base_date.strftime('%Y-%m-%d')}`  Top N：`{top_n}`  区间：`{start_date.strftime('%Y-%m-%d')}` 至 `{end_date.strftime('%Y-%m-%d')}`"
+    )
+
+    if not selected_boards:
+        st.info("当前基准日期没有可用的板块总分数据。")
+        return
+
+    st.caption("基准日期入选板块：" + "、".join(selected_boards))
+    history_df = build_total_history_frame_cached(
+        propagation_history_df,
+        available_trade_date_keys,
+        history_date_keys,
+        selected_boards,
+        start_date.strftime("%Y-%m-%d"),
+        end_date.strftime("%Y-%m-%d"),
+        dataset_signature,
+        coverage_signature,
+        capacity_signature,
+        total_signature,
+        feature_df,
+        raw_df,
+        mapping_df,
+        coverage_config,
+        capacity_config,
+        total_config,
+    )
+
+    if history_df.empty:
+        st.info("当前时间区间没有可展示的总分历史。")
+        return
+
+    history_df["板块"] = pd.Categorical(history_df["板块"], categories=list(selected_boards), ordered=True)
+    history_df = history_df.sort_values(["传播度日期", "板块"]).reset_index(drop=True)
+    fig = px.line(
+        history_df,
+        x="传播度日期",
+        y="总分",
+        color="板块",
+        markers=True,
+        category_orders={"板块": list(selected_boards)},
+        hover_data={
+            "板块": True,
+            "传播度日期": "|%Y-%m-%d",
+            "匹配交易日": "|%Y-%m-%d",
+            "总分": ":.2f",
+            "传播度": ":.2f",
+            "传播度放大分": ":.2f",
+            "板块加权包含度得分": ":.2f",
+            "综合容量分": ":.2f",
+        },
+    )
+    fig.update_layout(
+        height=460,
+        margin=dict(l=16, r=16, t=24, b=16),
+        legend_title_text="板块",
+        xaxis_title="传播度日期",
+        yaxis_title="总分",
+        hovermode="x unified",
+    )
+    fig.update_yaxes(range=[0, 100])
+    st.plotly_chart(fig, use_container_width=True)
 
 
 def match_trade_date(propagation_date: pd.Timestamp, trade_dates: list[pd.Timestamp]) -> pd.Timestamp:
@@ -719,11 +1035,21 @@ def main() -> None:
 
     with tab3:
         render_total_tab(
+            raw_df,
+            feature_df,
+            mapping_df,
+            propagation_history_df,
+            available_dates,
+            propagation_dates,
+            dataset_signature,
+            pd.Timestamp(selected_propagation_date),
             tuned_coverage_board,
             baseline_coverage_board,
             tuned_capacity_df,
             baseline_capacity_df,
             selected_propagation_df,
+            coverage_config,
+            capacity_config,
             total_config,
         )
 
