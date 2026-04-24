@@ -24,13 +24,13 @@ class CoverageConfig:
 
 @dataclass(frozen=True)
 class CapacityConfig:
-    static_market_cap_divisor: float = 125000.0
+    static_market_cap_divisor: float = 75000.0
     turnover_share_full_score_ratio: float = 0.10
     turnover_share_weight: float = 0.5
     limit_up_count_multiplier: float = 1.0
-    limit_up_market_cap_divisor: float = 50000.0
+    limit_up_market_cap_divisor: float = 30000.0
     limit_up_turnover_divisor: float = 3000.0
-    limit_up_count_weight: float = 0.3
+    limit_up_count_weight: float = 0.1
     limit_up_market_cap_weight: float = 0.2
     limit_up_turnover_weight: float = 0.2
     final_dynamic_weight: float = 0.8
@@ -45,9 +45,9 @@ class CapacityConfig:
 @dataclass(frozen=True)
 class TotalConfig:
     coverage_weight: float = 0.2
-    capacity_weight: float = 0.25
-    propagation_weight: float = 0.55
-    propagation_multiplier: float = 1.0
+    capacity_weight: float = 0.2
+    propagation_weight: float = 0.6
+    propagation_multiplier: float = 1.8
 
     def to_dict(self) -> dict[str, object]:
         return asdict(self)

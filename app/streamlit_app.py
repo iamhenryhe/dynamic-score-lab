@@ -49,7 +49,7 @@ def ensure_capacity_config_compat(config: CapacityConfig) -> CapacityConfig:
     defaults = {
         "turnover_share_full_score_ratio": 0.10,
         "turnover_share_weight": 0.5,
-        "limit_up_count_weight": 0.3,
+        "limit_up_count_weight": 0.1,
         "limit_up_market_cap_weight": 0.2,
         "limit_up_turnover_weight": 0.2,
         "final_dynamic_weight": 0.8,
@@ -501,13 +501,13 @@ def build_coverage_panel() -> CoverageConfig:
 
 def build_capacity_panel() -> CapacityConfig:
     panel = st.sidebar.expander("板块容量参数", expanded=False)
-    static_market_cap_divisor = panel.number_input("静态容量分分母", min_value=1.0, max_value=500000.0, value=125000.0, step=1000.0, key="cap_static_div")
+    static_market_cap_divisor = panel.number_input("静态容量分分母", min_value=1.0, max_value=500000.0, value=75000.0, step=1000.0, key="cap_static_div")
     turnover_share_full_score_percent = panel.number_input("成交占比满分标准", min_value=0.1, max_value=100.0, value=10.0, step=0.1, key="cap_turnover_share_full")
     turnover_share_weight = panel.slider("成交占比得分权重", min_value=0.0, max_value=2.0, value=0.5, step=0.05, key="cap_turnover_share_weight")
     limit_up_count_multiplier = panel.number_input("涨停家数得分系数", min_value=0.1, max_value=20.0, value=1.0, step=0.1, key="cap_count_multiplier")
-    limit_up_market_cap_divisor = panel.number_input("涨停股总市值分母", min_value=1.0, max_value=500000.0, value=50000.0, step=1000.0, key="cap_mc_div")
+    limit_up_market_cap_divisor = panel.number_input("涨停股总市值分母", min_value=1.0, max_value=500000.0, value=30000.0, step=1000.0, key="cap_mc_div")
     limit_up_turnover_divisor = panel.number_input("涨停股成交额分母", min_value=1.0, max_value=50000.0, value=3000.0, step=100.0, key="cap_turnover_div")
-    limit_up_count_weight = panel.slider("涨停家数权重", min_value=0.0, max_value=2.0, value=0.3, step=0.05, key="cap_count_weight")
+    limit_up_count_weight = panel.slider("涨停家数权重", min_value=0.0, max_value=2.0, value=0.1, step=0.05, key="cap_count_weight")
     limit_up_market_cap_weight = panel.slider("涨停股总市值权重", min_value=0.0, max_value=2.0, value=0.2, step=0.05, key="cap_mc_weight")
     limit_up_turnover_weight = panel.slider("涨停股成交额权重", min_value=0.0, max_value=2.0, value=0.2, step=0.05, key="cap_turnover_weight")
     final_dynamic_weight = panel.slider("综合分中动态权重", min_value=0.0, max_value=2.0, value=0.8, step=0.05, key="cap_final_dynamic")
@@ -542,10 +542,10 @@ def build_capacity_panel() -> CapacityConfig:
 
 def build_total_panel() -> TotalConfig:
     panel = st.sidebar.expander("总分参数", expanded=False)
-    propagation_multiplier = panel.number_input("传播度放大倍数", min_value=0.0, max_value=20.0, value=1.0, step=0.1, key="total_prop_multiplier")
-    propagation_weight_percent = panel.slider("总分中传播度权重", min_value=0, max_value=100, value=55, step=1, key="total_prop_weight_percent")
+    propagation_multiplier = panel.number_input("传播度放大倍数", min_value=0.0, max_value=20.0, value=1.8, step=0.1, key="total_prop_multiplier")
+    propagation_weight_percent = panel.slider("总分中传播度权重", min_value=0, max_value=100, value=60, step=1, key="total_prop_weight_percent")
     coverage_weight_percent = panel.slider("总分中包含度权重", min_value=0, max_value=100, value=20, step=1, key="total_cov_weight_percent")
-    capacity_weight_percent = panel.slider("总分中容量权重", min_value=0, max_value=100, value=25, step=1, key="total_cap_weight_percent")
+    capacity_weight_percent = panel.slider("总分中容量权重", min_value=0, max_value=100, value=20, step=1, key="total_cap_weight_percent")
     kwargs = {
         "coverage_weight": float(coverage_weight_percent) / 100,
         "capacity_weight": float(capacity_weight_percent) / 100,
